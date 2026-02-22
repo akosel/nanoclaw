@@ -77,10 +77,17 @@ Messages and task operations are verified against group identity:
 **Credential Filtering:**
 Only these environment variables are exposed to containers:
 ```typescript
-const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+const allowedVars = [
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'OPENAI_*',
+  'NANOCLAW_AGENT_PROVIDER',
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+];
 ```
 
-> **Note:** Anthropic credentials are mounted so that Claude Code can authenticate when the agent runs. However, this means the agent itself can discover these credentials via Bash or file operations. Ideally, Claude Code would authenticate without exposing credentials to the agent's execution environment, but I couldn't figure this out. **PRs welcome** if you have ideas for credential isolation.
+> **Note:** Credentials passed into the container (including GitHub tokens for `gh`/`git`) may be visible to agent-invoked shell commands. This is a tradeoff to enable repo operations like `git push` without mounting SSH keys.
 
 ## Privilege Comparison
 

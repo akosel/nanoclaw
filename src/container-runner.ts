@@ -229,6 +229,8 @@ function readSecrets(): Record<string, string> {
     'OPENAI_BASE_URL',
     'OPENAI_MODEL',
     'NANOCLAW_AGENT_PROVIDER',
+    'GH_TOKEN',
+    'GITHUB_TOKEN',
     'CODEX_AUTH_JSON_PATH',
   ]);
 

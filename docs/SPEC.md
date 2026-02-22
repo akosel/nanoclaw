@@ -223,6 +223,20 @@ registerGroup("1234567890@g.us", {
 
 Additional mounts appear at `/workspace/extra/{containerPath}` inside the container.
 
+Example: mount a repo for agent `git`/`gh` work (requires allowlist approval):
+
+```typescript
+containerConfig: {
+  additionalMounts: [
+    {
+      hostPath: "~/src/my-repo",
+      containerPath: "my-repo",
+      readonly: false, // requires allowed root with allowReadWrite: true
+    },
+  ],
+}
+```
+
 **Mount syntax note:** Read-write mounts use `-v host:container`, but readonly mounts require `--mount "type=bind,source=...,target=...,readonly"` (the `:ro` suffix may not work on all runtimes).
 
 ### Claude Authentication
@@ -241,6 +255,22 @@ ANTHROPIC_API_KEY=sk-ant-api03-...
 ```
 
 Only the authentication variables (`CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`) are extracted from `.env` and written to `data/env/env`, then mounted into the container at `/workspace/env-dir/env` and sourced by the entrypoint script. This ensures other environment variables in `.env` are not exposed to the agent. This workaround is needed because some container runtimes lose `-e` environment variables when using `-i` (interactive mode with piped stdin).
+
+### GitHub Authentication (for `gh` and `git push`)
+
+You can also expose a GitHub token to the container agent via `.env`:
+
+```bash
+GH_TOKEN=github_pat_...
+# or
+GITHUB_TOKEN=github_pat_...
+```
+
+When a GitHub token is present, NanoClaw configures `git` inside the container to:
+- rewrite `git@github.com:owner/repo.git` remotes to HTTPS
+- provide credentials from `GH_TOKEN`
+
+This allows `git fetch/pull/push` to work without mounting SSH keys. `gh` can use the same token (`gh auth status`, `gh pr ...`, etc.).
 
 ### Changing the Assistant Name
 

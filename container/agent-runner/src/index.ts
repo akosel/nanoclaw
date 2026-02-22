@@ -17,6 +17,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { spawn } from 'child_process';
 import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
@@ -66,6 +67,20 @@ interface OpenAiSessionState {
   messages: OpenAiChatMessage[];
 }
 
+interface BashExecResult {
+  command: string;
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}
+
+type OpenAiDirectCommand =
+  | { type: 'bash'; command: string }
+  | { type: 'skill-list' }
+  | { type: 'skill-show'; name: string }
+  | { type: 'skill-use'; name: string; task: string };
+
 interface CodexSseEvent {
   event?: string;
   data?: unknown;
@@ -74,6 +89,10 @@ interface CodexSseEvent {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+const OPENAI_BASH_MAX_STEPS = 6;
+const OPENAI_BASH_TIMEOUT_MS = 120_000;
+const OPENAI_BASH_MAX_OUTPUT = 16_000;
+const OPENAI_SKILL_MAX_CONTENT = 24_000;
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -208,6 +227,47 @@ const SECRET_ENV_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'OPENAI
 
 const OPENAI_SESSIONS_DIR = '/home/node/.claude/nanoclaw-openai-sessions';
 
+function configureGithubGitAuthEnv(env: Record<string, string | undefined>): void {
+  const token = env.GH_TOKEN || env.GITHUB_TOKEN;
+  if (!token) return;
+
+  // Normalize for tools that prefer one name or the other.
+  if (!env.GH_TOKEN) env.GH_TOKEN = token;
+  if (!env.GITHUB_TOKEN) env.GITHUB_TOKEN = token;
+
+  // Configure git via env-only config so pushes work without mutating mounted repos.
+  // This rewrites GitHub SSH remotes to HTTPS and serves credentials from GH_TOKEN.
+  const entries: Array<[string, string]> = [
+    ['url.https://github.com/.insteadof', 'git@github.com:'],
+    ['url.https://github.com/.insteadof', 'ssh://git@github.com/'],
+    ['credential.https://github.com.helper', '!f() { test "$1" = get || exit 0; echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'],
+  ];
+
+  env.GIT_CONFIG_COUNT = String(entries.length);
+  for (let i = 0; i < entries.length; i++) {
+    env[`GIT_CONFIG_KEY_${i}`] = entries[i][0];
+    env[`GIT_CONFIG_VALUE_${i}`] = entries[i][1];
+  }
+}
+
+function exposeGithubAuthToToolSubprocesses(env: Record<string, string | undefined>): void {
+  // Bash/gh/git commands run as subprocesses from this process and need these vars
+  // in process.env. Keep API/provider creds isolated in sdkEnv only.
+  const passthroughPrefixes = ['GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_'];
+  const passthroughExact = new Set([
+    'GH_TOKEN',
+    'GITHUB_TOKEN',
+    'GIT_CONFIG_COUNT',
+  ]);
+
+  for (const [key, value] of Object.entries(env)) {
+    if (!value) continue;
+    if (passthroughExact.has(key) || passthroughPrefixes.some((p) => key.startsWith(p))) {
+      process.env[key] = value;
+    }
+  }
+}
+
 function getProvider(env: Record<string, string | undefined>): AgentProvider {
   const configured = env.NANOCLAW_AGENT_PROVIDER?.toLowerCase();
   if (configured === 'openai') return 'openai';
@@ -276,6 +336,283 @@ function buildOpenAiSystemPrompt(containerInput: ContainerInput): string | undef
     'Follow the memory files below as operating context.',
     parts.join('\n\n---\n\n'),
   ].join('\n\n');
+}
+
+function buildOpenAiBashToolPrompt(): string {
+  return [
+    'Tooling available: Bash shell commands can be executed by this runtime.',
+    'When you need to run a shell command, respond with ONLY a single XML block:',
+    '<bash>',
+    'your command here',
+    '</bash>',
+    'Do not include any other text in that message.',
+    'After you receive command output, continue reasoning and either emit another <bash> block or provide the final user-facing answer.',
+    'Run commands in /workspace/group unless you need another directory.',
+  ].join('\n');
+}
+
+function extractBashCommand(text: string): string | null {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^<bash>\s*([\s\S]*?)\s*<\/bash>$/);
+  if (!match) return null;
+  const command = match[1].trim();
+  return command || null;
+}
+
+function truncateText(input: string, maxChars: number): string {
+  if (input.length <= maxChars) return input;
+  return input.slice(0, maxChars) + `\n...[truncated ${input.length - maxChars} chars]`;
+}
+
+function parseOpenAiDirectCommand(prompt: string): OpenAiDirectCommand | null {
+  const trimmed = extractDirectCommandCandidate(prompt);
+  if (!trimmed.startsWith('/')) return null;
+
+  if (trimmed.startsWith('/bash')) {
+    const rest = trimmed.slice('/bash'.length).trim();
+    if (!rest) return null;
+    return { type: 'bash', command: rest };
+  }
+
+  if (!trimmed.startsWith('/skill')) return null;
+  const after = trimmed.slice('/skill'.length).trim();
+  if (!after || after === 'list') return { type: 'skill-list' };
+
+  const lines = trimmed.split('\n');
+  const firstLine = lines[0].trim();
+  const firstParts = firstLine.split(/\s+/);
+
+  if (firstParts[1] === 'show' && firstParts[2]) {
+    return { type: 'skill-show', name: firstParts[2] };
+  }
+
+  if (firstParts[1] === 'use' && firstParts[2]) {
+    const task = lines.slice(1).join('\n').trim();
+    return { type: 'skill-use', name: firstParts[2], task };
+  }
+
+  // Shorthand:
+  // /skill <name>
+  // <task...>
+  if (firstParts[1]) {
+    const task = lines.slice(1).join('\n').trim();
+    return { type: 'skill-use', name: firstParts[1], task };
+  }
+
+  return null;
+}
+
+function extractDirectCommandCandidate(prompt: string): string {
+  const raw = prompt.trim();
+  if (raw.startsWith('/')) return raw;
+
+  // NanoClaw often wraps prompts as:
+  // <messages><message ...>@Andy /bash ...</message></messages>
+  // Extract the last message body and strip a leading @mention.
+  const matches = [...raw.matchAll(/<message\b[^>]*>([\s\S]*?)<\/message>/g)];
+  if (matches.length === 0) return raw;
+
+  const lastBody = (matches[matches.length - 1][1] || '').trim();
+  const withoutMention = lastBody.replace(/^@\S+\s+/, '').trim();
+  return withoutMention || lastBody;
+}
+
+function buildBashExecEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const key of SECRET_ENV_VARS) {
+    delete env[key];
+  }
+  return env;
+}
+
+function formatBashExecForUser(result: BashExecResult): string {
+  return [
+    `Command: ${result.command}`,
+    `Exit code: ${result.exitCode === null ? 'null' : result.exitCode}`,
+    `Timed out: ${result.timedOut ? 'yes' : 'no'}`,
+    '',
+    'STDOUT:',
+    '```',
+    result.stdout || '(empty)',
+    '```',
+    '',
+    'STDERR:',
+    '```',
+    result.stderr || '(empty)',
+    '```',
+  ].join('\n');
+}
+
+async function execBashCommand(command: string): Promise<BashExecResult> {
+  return new Promise((resolve) => {
+    const child = spawn('bash', ['-lc', command], {
+      cwd: '/workspace/group',
+      env: buildBashExecEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+    let timedOut = false;
+
+    const append = (
+      chunk: string,
+      current: string,
+      truncated: boolean,
+    ): { text: string; truncated: boolean } => {
+      if (truncated) return { text: current, truncated };
+      const remaining = OPENAI_BASH_MAX_OUTPUT - current.length;
+      if (remaining <= 0) return { text: current, truncated: true };
+      if (chunk.length > remaining) {
+        return { text: current + chunk.slice(0, remaining), truncated: true };
+      }
+      return { text: current + chunk, truncated: false };
+    };
+
+    child.stdout.on('data', (data) => {
+      const out = append(String(data), stdout, stdoutTruncated);
+      stdout = out.text;
+      stdoutTruncated = out.truncated;
+    });
+    child.stderr.on('data', (data) => {
+      const out = append(String(data), stderr, stderrTruncated);
+      stderr = out.text;
+      stderrTruncated = out.truncated;
+    });
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, OPENAI_BASH_TIMEOUT_MS);
+
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      resolve({
+        command,
+        exitCode: code,
+        stdout: truncateText(stdout, OPENAI_BASH_MAX_OUTPUT),
+        stderr: truncateText(stderr, OPENAI_BASH_MAX_OUTPUT),
+        timedOut,
+      });
+    });
+  });
+}
+
+function formatBashResultForModel(result: BashExecResult): string {
+  return [
+    'Bash command result:',
+    `Command: ${result.command}`,
+    `Exit code: ${result.exitCode === null ? 'null' : result.exitCode}`,
+    `Timed out: ${result.timedOut ? 'yes' : 'no'}`,
+    'STDOUT:',
+    result.stdout || '(empty)',
+    'STDERR:',
+    result.stderr || '(empty)',
+    'If you need another command, respond with ONLY a <bash>...</bash> block. Otherwise provide the final answer for the user.',
+  ].join('\n');
+}
+
+interface SkillInfo {
+  name: string;
+  path: string;
+}
+
+function getSkillBaseDir(): string {
+  // Skills are synced by host into each group's ~/.claude/skills/
+  return '/home/node/.claude/skills';
+}
+
+function listAvailableSkills(): SkillInfo[] {
+  const base = getSkillBaseDir();
+  if (!fs.existsSync(base)) return [];
+  const results: SkillInfo[] = [];
+  for (const entry of fs.readdirSync(base)) {
+    const skillPath = path.join(base, entry, 'SKILL.md');
+    if (fs.existsSync(skillPath)) {
+      results.push({ name: entry, path: skillPath });
+    }
+  }
+  return results.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function loadSkillContent(name: string): { name: string; content: string; path: string } | null {
+  const skills = listAvailableSkills();
+  const normalized = name.trim().toLowerCase();
+  const exact = skills.find((s) => s.name.toLowerCase() === normalized);
+  if (!exact) return null;
+  const raw = fs.readFileSync(exact.path, 'utf-8');
+  return {
+    name: exact.name,
+    path: exact.path,
+    content: truncateText(raw, OPENAI_SKILL_MAX_CONTENT),
+  };
+}
+
+async function handleOpenAiDirectCommand(
+  direct: OpenAiDirectCommand,
+): Promise<{ handled: true; result?: string; transformedPrompt?: string }> {
+  if (direct.type === 'bash') {
+    const result = await execBashCommand(direct.command);
+    return { handled: true, result: formatBashExecForUser(result) };
+  }
+
+  if (direct.type === 'skill-list') {
+    const skills = listAvailableSkills();
+    if (skills.length === 0) {
+      return { handled: true, result: 'No skills found in /home/node/.claude/skills.' };
+    }
+    return {
+      handled: true,
+      result: [
+        'Available skills:',
+        ...skills.map((s) => `- ${s.name}`),
+        '',
+        'Use `/skill show <name>` to inspect one, or `/skill use <name>` followed by a task on the next lines.',
+      ].join('\n'),
+    };
+  }
+
+  if (direct.type === 'skill-show') {
+    const skill = loadSkillContent(direct.name);
+    if (!skill) {
+      return { handled: true, result: `Skill not found: ${direct.name}` };
+    }
+    return {
+      handled: true,
+      result: [
+        `Skill: ${skill.name}`,
+        `Path: ${skill.path}`,
+        '',
+        '```md',
+        skill.content,
+        '```',
+      ].join('\n'),
+    };
+  }
+
+  const skill = loadSkillContent(direct.name);
+  if (!skill) {
+    return { handled: true, result: `Skill not found: ${direct.name}` };
+  }
+  if (!direct.task.trim()) {
+    return {
+      handled: true,
+      result: `No task provided. Usage:\n/skill use ${skill.name}\n<your task here>`,
+    };
+  }
+
+  const transformedPrompt = [
+    `Use the skill "${skill.name}" for this task.`,
+    '',
+    'Skill instructions:',
+    skill.content,
+    '',
+    'Task:',
+    direct.task,
+  ].join('\n');
+  return { handled: true, transformedPrompt };
 }
 
 async function callOpenAiChat(
@@ -791,26 +1128,65 @@ async function runOpenAiQuery(
   containerInput: ContainerInput,
   env: Record<string, string | undefined>,
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
+  const direct = parseOpenAiDirectCommand(prompt);
+  if (direct) {
+    const handled = await handleOpenAiDirectCommand(direct);
+    if (handled.result != null) {
+      writeOutput({
+        status: 'success',
+        result: handled.result,
+        newSessionId: sessionId,
+      });
+      return { newSessionId: sessionId, closedDuringQuery: false };
+    }
+    if (handled.transformedPrompt) {
+      prompt = handled.transformedPrompt;
+    }
+  }
+
   const newSessionId = sessionId || crypto.randomUUID();
   const session = loadOpenAiSession(newSessionId);
 
   if (session.messages.length === 0) {
     const systemPrompt = buildOpenAiSystemPrompt(containerInput);
-    if (systemPrompt) {
-      session.messages.push({ role: 'system', content: systemPrompt });
+    const parts = [systemPrompt, buildOpenAiBashToolPrompt()].filter(Boolean);
+    if (parts.length > 0) {
+      session.messages.push({ role: 'system', content: parts.join('\n\n') });
     }
   }
 
   session.messages.push({ role: 'user', content: prompt });
 
-  log(`OpenAI backend: sending chat completion (session=${newSessionId}, messages=${session.messages.length})`);
-  const assistantText = await callOpenAiChat(session.messages, env);
-  session.messages.push({ role: 'assistant', content: assistantText });
+  let finalAssistantText = '';
+  for (let step = 0; step < OPENAI_BASH_MAX_STEPS; step++) {
+    log(`OpenAI backend: sending chat completion (session=${newSessionId}, messages=${session.messages.length}, step=${step + 1})`);
+    const assistantText = await callOpenAiChat(session.messages, env);
+    session.messages.push({ role: 'assistant', content: assistantText });
+
+    const bashCommand = extractBashCommand(assistantText);
+    if (!bashCommand) {
+      finalAssistantText = assistantText;
+      break;
+    }
+
+    log(`OpenAI bash tool request: ${bashCommand.slice(0, 200)}`);
+    const result = await execBashCommand(bashCommand);
+    session.messages.push({
+      role: 'user',
+      content: formatBashResultForModel(result),
+    });
+  }
+
+  if (!finalAssistantText) {
+    finalAssistantText = 'I hit the maximum number of bash tool steps before finishing. Please narrow the request and try again.';
+    session.messages.push({ role: 'assistant', content: finalAssistantText });
+  }
+
   saveOpenAiSession(newSessionId, session);
 
   writeOutput({
     status: 'success',
-    result: assistantText,
+    result: finalAssistantText,
     newSessionId,
   });
 
@@ -841,6 +1217,8 @@ async function main(): Promise<void> {
   for (const [key, value] of Object.entries(containerInput.secrets || {})) {
     sdkEnv[key] = value;
   }
+  configureGithubGitAuthEnv(sdkEnv);
+  exposeGithubAuthToToolSubprocesses(sdkEnv);
   const provider = getProvider(sdkEnv);
   log(`Provider selected: ${provider}`);
 
