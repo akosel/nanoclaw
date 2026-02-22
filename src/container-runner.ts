@@ -4,6 +4,7 @@
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -180,8 +181,77 @@ function buildVolumeMounts(
  * Read allowed secrets from .env for passing to the container via stdin.
  * Secrets are never written to disk or mounted as files.
  */
+function expandHomePath(inputPath: string): string {
+  if (inputPath === '~') return os.homedir();
+  if (inputPath.startsWith('~/')) return path.join(os.homedir(), inputPath.slice(2));
+  return inputPath;
+}
+
+function readCodexAuthSecrets(authJsonPath: string): Record<string, string> {
+  try {
+    const resolved = expandHomePath(authJsonPath);
+    const raw = fs.readFileSync(resolved, 'utf-8');
+    const parsed = JSON.parse(raw) as {
+      OPENAI_API_KEY?: string | null;
+      tokens?: { access_token?: string; account_id?: string };
+    };
+
+    const result: Record<string, string> = {};
+
+    if (typeof parsed.OPENAI_API_KEY === 'string' && parsed.OPENAI_API_KEY.trim()) {
+      result.OPENAI_API_KEY = parsed.OPENAI_API_KEY.trim();
+      return result;
+    }
+
+    const accessToken = parsed.tokens?.access_token;
+    if (typeof accessToken === 'string' && accessToken.trim()) {
+      result.OPENAI_OAUTH_ACCESS_TOKEN = accessToken.trim();
+    }
+    const accountId = parsed.tokens?.account_id;
+    if (typeof accountId === 'string' && accountId.trim()) {
+      result.OPENAI_CODEX_ACCOUNT_ID = accountId.trim();
+    }
+
+    return result;
+  } catch (err) {
+    logger.warn({ err, authJsonPath }, 'Failed to read CODEX auth file');
+    return {};
+  }
+}
+
 function readSecrets(): Record<string, string> {
-  return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
+  const envSecrets = readEnvFile([
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'ANTHROPIC_API_KEY',
+    'OPENAI_API_KEY',
+    'OPENAI_OAUTH_ACCESS_TOKEN',
+    'OPENAI_CODEX_ACCOUNT_ID',
+    'OPENAI_BASE_URL',
+    'OPENAI_MODEL',
+    'NANOCLAW_AGENT_PROVIDER',
+    'CODEX_AUTH_JSON_PATH',
+  ]);
+
+  const codexAuthPath = envSecrets.CODEX_AUTH_JSON_PATH;
+  if (!codexAuthPath) {
+    return envSecrets;
+  }
+
+  const codexSecrets = readCodexAuthSecrets(codexAuthPath);
+  const merged = { ...envSecrets };
+
+  if (!merged.OPENAI_API_KEY && codexSecrets.OPENAI_API_KEY) {
+    merged.OPENAI_API_KEY = codexSecrets.OPENAI_API_KEY;
+  }
+
+  if (!merged.OPENAI_API_KEY && !merged.OPENAI_OAUTH_ACCESS_TOKEN && codexSecrets.OPENAI_OAUTH_ACCESS_TOKEN) {
+    merged.OPENAI_OAUTH_ACCESS_TOKEN = codexSecrets.OPENAI_OAUTH_ACCESS_TOKEN;
+  }
+
+  // Do not pass host filesystem paths into the container.
+  delete merged.CODEX_AUTH_JSON_PATH;
+
+  return merged;
 }
 
 function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {

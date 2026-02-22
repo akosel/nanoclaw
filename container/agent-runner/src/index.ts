@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
@@ -52,6 +53,22 @@ interface SDKUserMessage {
   message: { role: 'user'; content: string };
   parent_tool_use_id: null;
   session_id: string;
+}
+
+type AgentProvider = 'claude' | 'openai';
+
+interface OpenAiChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+interface OpenAiSessionState {
+  messages: OpenAiChatMessage[];
+}
+
+interface CodexSseEvent {
+  event?: string;
+  data?: unknown;
 }
 
 const IPC_INPUT_DIR = '/workspace/ipc/input';
@@ -187,7 +204,286 @@ function createPreCompactHook(): HookCallback {
 // Secrets to strip from Bash tool subprocess environments.
 // These are needed by claude-code for API auth but should never
 // be visible to commands Kit runs.
-const SECRET_ENV_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'];
+const SECRET_ENV_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'OPENAI_API_KEY', 'OPENAI_OAUTH_ACCESS_TOKEN'];
+
+const OPENAI_SESSIONS_DIR = '/home/node/.claude/nanoclaw-openai-sessions';
+
+function getProvider(env: Record<string, string | undefined>): AgentProvider {
+  const configured = env.NANOCLAW_AGENT_PROVIDER?.toLowerCase();
+  if (configured === 'openai') return 'openai';
+  if (configured === 'claude') return 'claude';
+  if (env.OPENAI_API_KEY && !env.ANTHROPIC_API_KEY && !env.CLAUDE_CODE_OAUTH_TOKEN) {
+    return 'openai';
+  }
+  return 'claude';
+}
+
+function ensureOpenAiSessionsDir(): void {
+  fs.mkdirSync(OPENAI_SESSIONS_DIR, { recursive: true });
+}
+
+function openAiSessionPath(sessionId: string): string {
+  return path.join(OPENAI_SESSIONS_DIR, `${sessionId}.json`);
+}
+
+function loadOpenAiSession(sessionId: string): OpenAiSessionState {
+  ensureOpenAiSessionsDir();
+  const file = openAiSessionPath(sessionId);
+  if (!fs.existsSync(file)) return { messages: [] };
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf-8')) as OpenAiSessionState;
+    if (Array.isArray(parsed.messages)) return parsed;
+  } catch (err) {
+    log(`Failed to load OpenAI session ${sessionId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return { messages: [] };
+}
+
+function saveOpenAiSession(sessionId: string, state: OpenAiSessionState): void {
+  ensureOpenAiSessionsDir();
+  fs.writeFileSync(openAiSessionPath(sessionId), JSON.stringify(state, null, 2));
+}
+
+function readIfExists(filePath: string): string | null {
+  try {
+    if (fs.existsSync(filePath)) return fs.readFileSync(filePath, 'utf-8');
+  } catch {
+  }
+  return null;
+}
+
+function buildOpenAiSystemPrompt(containerInput: ContainerInput): string | undefined {
+  const parts: string[] = [];
+
+  const groupMemory = readIfExists('/workspace/group/CLAUDE.md');
+  if (groupMemory) {
+    parts.push('Group memory (CLAUDE.md):\n' + groupMemory);
+  }
+
+  const globalMemory = !containerInput.isMain ? readIfExists('/workspace/global/CLAUDE.md') : null;
+  if (globalMemory) {
+    parts.push('Global memory (CLAUDE.md):\n' + globalMemory);
+  }
+
+  const projectMemory = containerInput.isMain ? readIfExists('/workspace/project/CLAUDE.md') : null;
+  if (projectMemory) {
+    parts.push('Project memory (CLAUDE.md):\n' + projectMemory);
+  }
+
+  if (parts.length === 0) return undefined;
+  return [
+    'You are the assistant running inside NanoClaw.',
+    'Follow the memory files below as operating context.',
+    parts.join('\n\n---\n\n'),
+  ].join('\n\n');
+}
+
+async function callOpenAiChat(
+  messages: OpenAiChatMessage[],
+  env: Record<string, string | undefined>,
+): Promise<string> {
+  if (env.OPENAI_API_KEY) {
+    return callOpenAiApiChat(messages, env);
+  }
+  if (env.OPENAI_OAUTH_ACCESS_TOKEN) {
+    return callCodexOAuthChat(messages, env);
+  }
+
+  throw new Error('OPENAI_API_KEY or OPENAI_OAUTH_ACCESS_TOKEN is required when using NANOCLAW_AGENT_PROVIDER=openai');
+}
+
+async function callOpenAiApiChat(
+  messages: OpenAiChatMessage[],
+  env: Record<string, string | undefined>,
+): Promise<string> {
+  const bearerToken = env.OPENAI_API_KEY;
+  if (!bearerToken) {
+    throw new Error('OPENAI_API_KEY or OPENAI_OAUTH_ACCESS_TOKEN is required when using NANOCLAW_AGENT_PROVIDER=openai');
+  }
+
+  const baseUrl = (env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, '');
+  const model = env.OPENAI_MODEL || 'gpt-5-mini';
+
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${bearerToken}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+    }),
+  });
+
+  const raw = await response.text();
+  let data: any;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`OpenAI API returned non-JSON (${response.status}): ${raw.slice(0, 300)}`);
+  }
+
+  if (!response.ok) {
+    const apiMessage =
+      (data?.error?.message && String(data.error.message)) ||
+      raw.slice(0, 300);
+    throw new Error(`OpenAI API error ${response.status}: ${apiMessage}`);
+  }
+
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content === 'string' && content.trim()) return content;
+  if (Array.isArray(content)) {
+    const text = content
+      .map((part: any) => (typeof part?.text === 'string' ? part.text : ''))
+      .join('')
+      .trim();
+    if (text) return text;
+  }
+
+  throw new Error('OpenAI API returned no assistant text content');
+}
+
+function parseSseBlocks(buffer: string): { events: CodexSseEvent[]; rest: string } {
+  const events: CodexSseEvent[] = [];
+  let rest = buffer;
+  let idx: number;
+
+  while ((idx = rest.indexOf('\n\n')) !== -1) {
+    const block = rest.slice(0, idx);
+    rest = rest.slice(idx + 2);
+    if (!block.trim()) continue;
+
+    const lines = block.split('\n');
+    const eventLine = lines.find(l => l.startsWith('event:'));
+    const dataLines = lines.filter(l => l.startsWith('data:')).map(l => l.slice(5).trim());
+    const dataRaw = dataLines.join('\n');
+
+    if (!dataRaw || dataRaw === '[DONE]') {
+      events.push({ event: eventLine?.slice(6).trim(), data: '[DONE]' });
+      continue;
+    }
+
+    try {
+      events.push({
+        event: eventLine?.slice(6).trim(),
+        data: JSON.parse(dataRaw),
+      });
+    } catch {
+      events.push({
+        event: eventLine?.slice(6).trim(),
+        data: dataRaw,
+      });
+    }
+  }
+
+  return { events, rest };
+}
+
+function collectCodexCompletedText(data: any): string {
+  const output = data?.response?.output;
+  if (!Array.isArray(output)) return '';
+
+  const chunks: string[] = [];
+  for (const item of output) {
+    const content = item?.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (typeof part?.text === 'string') {
+        chunks.push(part.text);
+      } else if (typeof part?.output_text === 'string') {
+        chunks.push(part.output_text);
+      }
+    }
+  }
+  return chunks.join('').trim();
+}
+
+async function callCodexOAuthChat(
+  messages: OpenAiChatMessage[],
+  env: Record<string, string | undefined>,
+): Promise<string> {
+  const bearerToken = env.OPENAI_OAUTH_ACCESS_TOKEN;
+  if (!bearerToken) {
+    throw new Error('OPENAI_OAUTH_ACCESS_TOKEN is required for Codex OAuth backend');
+  }
+
+  const accountId = env.OPENAI_CODEX_ACCOUNT_ID;
+  const model = env.OPENAI_MODEL || 'gpt-5.3-codex';
+  const instructions = messages
+    .filter(m => m.role === 'system')
+    .map(m => m.content.trim())
+    .filter(Boolean)
+    .join('\n\n');
+
+  const input = messages
+    .filter(m => m.role !== 'system')
+    .map(m => ({
+      role: m.role,
+      content: [{
+        type: m.role === 'assistant' ? 'output_text' : 'input_text',
+        text: m.content,
+      }],
+    }));
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: 'text/event-stream',
+    Authorization: `Bearer ${bearerToken}`,
+  };
+  if (accountId) {
+    headers['ChatGPT-Account-Id'] = accountId;
+  }
+
+  const response = await fetch('https://chatgpt.com/backend-api/codex/responses', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model,
+      instructions: instructions || 'You are a helpful assistant.',
+      input,
+      stream: true,
+      store: false,
+    }),
+  });
+
+  if (!response.ok || !response.body) {
+    const raw = await response.text();
+    throw new Error(`Codex OAuth error ${response.status}: ${raw.slice(0, 300)}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let text = '';
+  let completedText = '';
+
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+
+    const parsed = parseSseBlocks(buffer);
+    buffer = parsed.rest;
+
+    for (const ev of parsed.events) {
+      const data = ev.data;
+      if (!data || typeof data !== 'object') continue;
+      const typed = data as { type?: string; delta?: string };
+      if (typed.type === 'response.output_text.delta' && typeof typed.delta === 'string') {
+        text += typed.delta;
+      } else if (typed.type === 'response.completed') {
+        completedText = collectCodexCompletedText(data);
+      }
+    }
+  }
+
+  const finalText = (completedText || text).trim();
+  if (!finalText) {
+    throw new Error('Codex OAuth backend returned no assistant text content');
+  }
+  return finalText;
+}
 
 function createSanitizeBashHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -489,6 +785,38 @@ async function runQuery(
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
 
+async function runOpenAiQuery(
+  prompt: string,
+  sessionId: string | undefined,
+  containerInput: ContainerInput,
+  env: Record<string, string | undefined>,
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
+  const newSessionId = sessionId || crypto.randomUUID();
+  const session = loadOpenAiSession(newSessionId);
+
+  if (session.messages.length === 0) {
+    const systemPrompt = buildOpenAiSystemPrompt(containerInput);
+    if (systemPrompt) {
+      session.messages.push({ role: 'system', content: systemPrompt });
+    }
+  }
+
+  session.messages.push({ role: 'user', content: prompt });
+
+  log(`OpenAI backend: sending chat completion (session=${newSessionId}, messages=${session.messages.length})`);
+  const assistantText = await callOpenAiChat(session.messages, env);
+  session.messages.push({ role: 'assistant', content: assistantText });
+  saveOpenAiSession(newSessionId, session);
+
+  writeOutput({
+    status: 'success',
+    result: assistantText,
+    newSessionId,
+  });
+
+  return { newSessionId, closedDuringQuery: false };
+}
+
 async function main(): Promise<void> {
   let containerInput: ContainerInput;
 
@@ -513,6 +841,8 @@ async function main(): Promise<void> {
   for (const [key, value] of Object.entries(containerInput.secrets || {})) {
     sdkEnv[key] = value;
   }
+  const provider = getProvider(sdkEnv);
+  log(`Provider selected: ${provider}`);
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
@@ -540,7 +870,9 @@ async function main(): Promise<void> {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      const queryResult = provider === 'openai'
+        ? await runOpenAiQuery(prompt, sessionId, containerInput, sdkEnv)
+        : await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
